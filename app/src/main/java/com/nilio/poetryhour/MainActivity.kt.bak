@@ -1,0 +1,232 @@
+package com.nilio.poetryhour
+
+import android.content.Context
+import android.os.Bundle
+import android.util.Log
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.CompatibilityList
+import org.tensorflow.lite.gpu.GpuDelegate
+import org.tensorflow.lite.support.common.FileUtil
+import java.util.PriorityQueue
+
+class MainActivity : ComponentActivity() {
+
+    // Update to match your renamed files
+    private val MODEL_FILENAME = "gemma.tflite"       // Was TF_LITE_PREFILL_DECODE
+    private val TOKENIZER_FILENAME = "tokenizer.spm"  // Was TOKENIZER_MODEL
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            TfliteRawScreen(applicationContext, MODEL_FILENAME, TOKENIZER_FILENAME)
+        }
+    }
+}
+
+@Composable
+fun TfliteRawScreen(context: Context, modelName: String, tokenizerName: String) {
+    val scope = rememberCoroutineScope()
+    var interpreter by remember { mutableStateOf<Interpreter?>(null) }
+    var suggestions by remember { mutableStateOf<List<String>>(emptyList()) }
+    var prompt by remember { mutableStateOf("The quick brown fox") }
+    var isThinking by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf("Initializing...") }
+
+    // 1. Initialize TFLite Interpreter with GPU
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            try {
+                val options = Interpreter.Options()
+
+                // Check for GPU support (Essential for LLMs)
+                if (CompatibilityList().isDelegateSupportedOnThisDevice) {
+                    options.addDelegate(GpuDelegate())
+                    status = "GPU Delegate Activated."
+                } else {
+                    status = "Warning: CPU Mode (Will be slow)."
+                }
+
+                // Load Model
+                // Note: We use FileUtil from tflite-support to help load MappedByteBuffer
+                val buffer = FileUtil.loadMappedFile(context, "models/$modelName")
+                interpreter = Interpreter(buffer, options)
+                Log.i("PoetryHour", "Loading tokenizer")
+                val success = NativeTokenizer.init(context, tokenizerName)
+                Log.i("PoetryHour", "Tokenizer loaded")
+                status = "Model Loaded. Ready."
+            } catch (e: Exception) {
+                status = "Init Failed: ${e.message}"
+            }
+        }
+    }
+
+    Column(modifier = Modifier.padding(16.dp)) {
+        Text("Raw TFLite Controller", style = MaterialTheme.typography.headlineSmall)
+        Text(status, color = MaterialTheme.colorScheme.secondary)
+
+        Spacer(Modifier.height(16.dp))
+
+        OutlinedTextField(
+            value = prompt,
+            onValueChange = { prompt = it },
+            label = { Text("Prompt") },
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        Spacer(Modifier.height(16.dp))
+
+        Button(
+            enabled = interpreter != null && !isThinking,
+            onClick = {
+                isThinking = true
+                scope.launch(Dispatchers.Default) {
+                    if (interpreter == null)
+                        Log.e("PoetryHour", "Interpreter is null")
+                    val results = runInference(interpreter!!, prompt)
+                    withContext(Dispatchers.Main) {
+                        suggestions = results
+                        isThinking = false
+                    }
+                }
+            }
+        ) {
+            Text(if (isThinking) "Calculating Logits..." else "Intercept Output Layer")
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        Text("Top 5 Probabilities (Raw Logits):")
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(suggestions) { word ->
+                SuggestionChip(
+                    onClick = { prompt += word.split(" ")[0] }, // Append word
+                    label = { Text(word) }
+                )
+            }
+        }
+    }
+}
+
+/**
+ * THE CORE LOGIC
+ * 1. Tokenize Input
+ * 2. Run Model
+ * 3. Extract Logits
+ * 4. Detokenize Top K
+ */
+fun runInference(interpreter: Interpreter, text: String): List<String> {
+    // --- STEP 1: TOKENIZATION ---
+    // ⚠️ REALITY CHECK: TFLite DOES NOT HAVE A TOKENIZER.
+    // You must use a library (like sentencepiece-android) to do this.
+    // For this demo, I am mocking it so the code compiles.
+    val inputIds = NativeTokenizer.encode(text)
+
+    // --- STEP 2: PREPARE INPUT/OUTPUT BUFFERS ---
+
+    // Input: [1, SequenceLength]
+    // We typically pass Int arrays for Token IDs
+    val inputs = arrayOf(inputIds)
+
+    // Output: The model returns logits for EVERY token in the sequence.
+    // Shape: [1, SequenceLength, VocabSize]
+    // Gemma Vocab Size is ~256,000.
+    val vocabSize = 256000
+    val seqLen = inputIds.size
+
+    // Optimization: Allocating [1, SeqLen, VocabSize] is HUGE (Hundreds of MBs).
+    // We usually only care about the LAST token's prediction.
+    // However, standard Interpreter.run returns everything.
+    // We allocate a buffer just big enough for the LAST timestep if the model signature allows,
+    // but most .tflite exports output the full sequence.
+
+    // Let's try to use a scratch buffer for the output.
+    // NOTE: If you get OutOfMemory, you must use a custom signature runner or C++ wrapper.
+    val outputBuffer = Array(1) { Array(seqLen) { FloatArray(vocabSize) } }
+    val outputs = mapOf(0 to outputBuffer)
+
+    // --- STEP 3: RUN INTERPRETER ---
+    try {
+        interpreter.runForMultipleInputsOutputs(inputs, outputs)
+    } catch (e: Exception) {
+        return listOf("Error: ${e.message}")
+    }
+
+    // --- STEP 4: INTERCEPT LOGITS ---
+    // We only care about the prediction for the *last* token input
+    val lastTokenIndex = seqLen - 1
+
+    // 1. Check Shape
+    val outputTensor = interpreter.getOutputTensor(0)
+    val outputShape = outputTensor.shape() // e.g., [1, 1, 256000]
+    Log.i("TFLite verification", "Output Shape: ${outputShape.joinToString(", ")}")
+
+    // 2. Handle "Decode" model shape
+    val logits: FloatArray
+    if (outputShape.size == 3 && outputShape[1] == 1) {
+        // This model only outputs the NEXT token prediction (not the whole sequence)
+        val outputBuffer = Array(1) { Array(1) { FloatArray(256000) } }
+        interpreter.runForMultipleInputsOutputs(inputs, mapOf(0 to outputBuffer))
+        logits = outputBuffer[0][0] // The raw probabilities
+    } else {
+        // It's a sequence model
+        // ... use previous logic
+        logits = outputBuffer[0][lastTokenIndex] // FloatArray[256000]
+    }
+
+    // --- STEP 5: MANUAL TOP-K ---
+    val topK = getTopK(logits, 5)
+
+    return topK.map { (id, score) ->
+        val word = NativeTokenizer.decode(id)
+        "$word (${"%.2f".format(score)})"
+    }
+}
+
+fun getTopK(logits: FloatArray, k: Int): List<Pair<Int, Float>> {
+    // Use a Min-Heap to keep the top K largest elements
+    val pq = PriorityQueue<Pair<Int, Float>>(k) { a, b ->
+        a.second.compareTo(b.second)
+    }
+
+    for (i in logits.indices) {
+        val score = logits[i]
+        if (pq.size < k) {
+            pq.add(i to score)
+        } else if (score > pq.peek().second) {
+            pq.poll()
+            pq.add(i to score)
+        }
+    }
+    // Return sorted (highest first)
+    return pq.sortedByDescending { it.second }
+}
+
+// --- MOCK TOKENIZER (PLACEHOLDER) ---
+// You MUST replace this with a real SentencePiece implementation.
+// Recommended: https://github.com/google/sentencepiece (C++ JNI)
+// or use a library like "tokenizers-kotlin"
+object MockTokenizer {
+    fun tokenize(text: String): IntArray {
+        // Mocking: Convert string length to dummy IDs
+        // In reality: return SentencePiece.encode(text)
+        return IntArray(text.length / 3 + 1) { 100 + it }
+    }
+
+    fun detokenize(id: Int): String {
+        // Mocking: Return dummy words
+        val vocab = listOf("java", "code", "love", "error", "coffee", "dream", "run")
+        return vocab[id % vocab.size]
+    }
+}

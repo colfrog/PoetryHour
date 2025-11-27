@@ -1,0 +1,6 @@
+[submodule "app/src/main/cpp/abseil-cpp"]
+	path = app/src/main/cpp/abseil-cpp
+	url = https://github.com/abseil/abseil-cpp.git
+[submodule "app/src/main/cpp/sentencepiece"]
+	path = app/src/main/cpp/sentencepiece
+	url = https://github.com/google/sentencepiece.git
