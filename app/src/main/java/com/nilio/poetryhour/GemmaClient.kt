@@ -2,8 +2,9 @@ package com.nilio.poetryhour
 
 import android.content.Context
 import android.util.Log
-import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.support.common.FileUtil
+import com.google.ai.edge.litert.CompiledModel
+import com.google.ai.edge.litert.Accelerator
+import com.google.ai.edge.litert.TensorBuffer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.PriorityQueue
@@ -13,13 +14,14 @@ import kotlin.random.Random
 
 class GemmaClient(context: Context, modelName: String) {
 
-    private var interpreter: Interpreter? = null
+    private var model: CompiledModel? = null
 
     // Buffers & Maps
-    private val inputBuffers = HashMap<Int, ByteBuffer>()
-    private val outputBuffers = HashMap<Int, ByteBuffer>()
+    private var inputBuffers: List<TensorBuffer> = emptyList()
+    private var outputBuffers: List<TensorBuffer> = emptyList()
     private var previousInput:String = ""
     var step = 0
+    var maskArray: FloatArray = FloatArray(0)
     private var vocabSize = 262144
     private val CACHE_MAPPING = listOf(
         Pair(40, 38), // Layer k_0
@@ -80,48 +82,18 @@ class GemmaClient(context: Context, modelName: String) {
     private val IDX_TOKEN = 36
     private val IDX_POS = 4
     private val IDX_MASK = 37
-    private var IDX_LOGITS = -1
+    private var IDX_LOGITS = 8
 
     init {
-        val options = Interpreter.Options()
+        val options = CompiledModel.Options(accelerators=arrayOf(Accelerator.CPU))
 
-        Log.i("GemmaClient", "Loadding mapped file")
-        val modelFile = FileUtil.loadMappedFile(context, "models/$modelName")
-        Log.i("GemmaClient", "Loading Interpreter")
-        interpreter = Interpreter(modelFile, options)
+        model = CompiledModel.create(context.assets, "models/$modelName", options)
         Log.i("GemmaClient", "Done loading Interpreter")
-        val session = interpreter!!
-        session.allocateTensors()
+        val session = model!!
 
-        val inputNames =
-            (0 until session.inputTensorCount).associateWith {
-                session.getInputTensor(it).name()
-            }
-        val outputNames =
-            (0 until session.outputTensorCount).associateWith {
-                session.getOutputTensor(it).name()
-            }
-
-        Log.i("GemmaClient", "Inputs: $inputNames")
-        Log.i("GemmaClient", "Outputs: $outputNames")
-
-        // Setup Inputs/Outputs
-        Log.i("GemmaClient", "Input tensor count: ${session.inputTensorCount}")
-        for (i in 0 until session.inputTensorCount) {
-            val tensor = session.getInputTensor(i)
-            inputBuffers[i] =
-                ByteBuffer.allocateDirect(tensor.numBytes()).order(ByteOrder.nativeOrder())
-        }
-        Log.i("GemmaClient", "Output tensor count: ${session.outputTensorCount}")
-        for (i in 0 until session.outputTensorCount) {
-            val tensor = session.getOutputTensor(i)
-            outputBuffers[i] =
-                ByteBuffer.allocateDirect(tensor.numBytes()).order(ByteOrder.nativeOrder())
-            if (tensor.shape().last() > 32000) {
-                IDX_LOGITS = i
-                vocabSize = tensor.shape().last()
-            }
-        }
+        inputBuffers = session.createInputBuffers()
+        outputBuffers = session.createOutputBuffers()
+        Log.i("GemmaClient", "Input: ${inputBuffers.size} Output: ${outputBuffers.size}")
     }
 
     fun format(text: String): String {
@@ -129,7 +101,7 @@ class GemmaClient(context: Context, modelName: String) {
     }
 
     fun predictNextPossibleWords(text: String, topK: Int = 5, temperature: Float = 1.0f): List<String> {
-        val session = interpreter ?: return emptyList()
+        val session = model ?: return emptyList()
 
         var tokens: IntArray = intArrayOf()
         if (previousInput != "" && text.startsWith(previousInput)) {
@@ -143,65 +115,30 @@ class GemmaClient(context: Context, modelName: String) {
             tokens = if (rawTokens.firstOrNull() != 2) intArrayOf(2) + rawTokens else rawTokens
             previousInput = text
             step = 0
+
+            maskArray = FloatArray(2048) { _ -> Float.NEGATIVE_INFINITY }
         }
 
-        var lastLogits: ByteBuffer? = null
-        inputBuffers[IDX_MASK]!!.clear()
-        val maskFloats = inputBuffers[IDX_MASK]!!.asFloatBuffer()
-        for (i in 0 until 2048) {
-            maskFloats.put(-1e9f)
-        }
-
-        // --- 1. INFERENCE LOOP ---
         for (token in tokens) {
-            // 1. Token Input (Index 36)
-            inputBuffers[IDX_TOKEN]?.clear()
-            inputBuffers[IDX_TOKEN]?.asIntBuffer()?.put(token)
+            inputBuffers[IDX_TOKEN].writeInt(intArrayOf(token))
+            inputBuffers[IDX_POS].writeInt(intArrayOf(step))
+            maskArray[step] = 0f
+            inputBuffers[IDX_MASK].writeFloat(maskArray)
 
-            // 2. Position Input (Index 4)
-            inputBuffers[IDX_POS]?.clear()
-            inputBuffers[IDX_POS]?.asIntBuffer()?.put(step)
+            session.run(inputBuffers, outputBuffers)
 
-            // 3. Attention Mask (Index 37)
-            // The mask is FLOAT32. We must fill the entire context window (2048).
-            // 1.0  = Valid (Pay attention to this position)
-            // -1e9 = Invalid (Ignore/Mask out this position)
-            val maskBuffer = inputBuffers[IDX_MASK]!!
-            maskBuffer.clear()
-            val maskFloats = maskBuffer.asFloatBuffer()
-
-            for (i in 0 until step) {
-                maskFloats.put(1f)
-            }
-            maskBuffer.rewind()
-
-            // 4. Run Inference
-            val inputsArray = arrayOfNulls<Any>(session.inputTensorCount)
-            inputBuffers.forEach { (k, v) -> v.rewind(); inputsArray[k] = v }
-
-            val outputsMap = HashMap<Int, Any>()
-            outputBuffers.forEach { (k, v) -> v.clear(); outputsMap[k] = v }
-
-            session.runForMultipleInputsOutputs(inputsArray, outputsMap)
-
-            // 5. Rotate Cache (Output -> Input)
             for ((inIdx, outIdx) in CACHE_MAPPING) {
-                safeCopy(outputBuffers[outIdx]!!, inputBuffers[inIdx]!!)
+                val content = outputBuffers[outIdx].readFloat()
+                inputBuffers[inIdx].writeFloat(content)
             }
 
             step += 1
         }
 
-        lastLogits = outputBuffers[IDX_LOGITS]
-        if (lastLogits == null) return emptyList()
+        val logits = outputBuffers[IDX_LOGITS].readFloat()
 
-        val rawLogits = FloatArray(vocabSize)
-        lastLogits.rewind()
-        lastLogits.asFloatBuffer().get(rawLogits)
-
-        val candidates = getTopCandidates(rawLogits, 200)
-
-
+        val candidates = getTopCandidates(logits, 200)
+        Log.i("GemmaClient", "Candidates: $candidates")
         val softmaxOp = SoftmaxWithTemperatureOp(temperature)
         val probabilities = softmaxOp.apply(candidates)
 
@@ -273,27 +210,15 @@ class GemmaClient(context: Context, modelName: String) {
 
     private fun clearCache() {
         val controls = listOf(IDX_TOKEN, IDX_POS, IDX_MASK)
-        for ((idx, buffer) in inputBuffers) {
-            if (controls.contains(idx)) continue
-            buffer.clear()
-            while(buffer.hasRemaining()) buffer.put(0.toByte())
-            buffer.clear()
+        for (buffer in inputBuffers) {
+            val content = buffer.readInt8()
+            for (i in 0 until content.size) {
+                content[i] = 0
+            }
+            buffer.writeInt8(content)
         }
     }
 
-    private fun safeCopy(source: ByteBuffer, dest: ByteBuffer) {
-        source.rewind()
-        dest.clear()
-        val limit = min(source.capacity(), dest.capacity())
-        source.limit(limit)
-        dest.put(source)
-        source.limit(source.capacity())
-    }
-
-    /**
-     * Custom Operator to apply Temperature Scaling and Softmax.
-     * We perform this on the reduced set of candidates for performance.
-     */
     private class SoftmaxWithTemperatureOp(private val temperature: Float) {
 
         fun apply(candidates: List<Candidate>): List<Candidate> {

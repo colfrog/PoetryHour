@@ -9,8 +9,7 @@ lifecycleRuntimeKtx = "2.6.1"
 activityCompose = "1.11.0"
 composeBom = "2024.09.00"
 foundationLayout = "1.9.5"
-litert = "1.4.1"
-litertSupport = "1.4.1"
+litert = "2.0.3"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -29,7 +28,6 @@ androidx-compose-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-te
 androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
 androidx-compose-foundation-layout = { group = "androidx.compose.foundation", name = "foundation-layout", version.ref = "foundationLayout" }
 litert = { module = "com.google.ai.edge.litert:litert", version.ref = "litert" }
-litert-support = { module = "com.google.ai.edge.litert:litert-support", version.ref = "litertSupport" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
