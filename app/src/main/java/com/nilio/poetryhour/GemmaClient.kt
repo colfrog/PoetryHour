@@ -5,11 +5,8 @@ import android.util.Log
 import com.google.ai.edge.litert.CompiledModel
 import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.TensorBuffer
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.PriorityQueue
 import kotlin.math.exp
-import kotlin.math.min
 import kotlin.random.Random
 
 class GemmaClient(context: Context, modelName: String) {
